@@ -8,21 +8,11 @@ use core::{
     num::NonZeroUsize,
     ptr,
     sync::atomic::{
-        AtomicPtr, AtomicUsize, AtomicBool,
-        Ordering::{Relaxed, SeqCst},
+        AtomicBool, AtomicPtr, AtomicUsize,
+        Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
     task::Waker,
 };
-
-// `AtomicMaybeWaker` requires https://github.com/rust-lang/rust/issues/87021
-/*
-
-struct AtomicMaybeWaker {
-    vtable: AtomicPtr<RawWakerVTable>,
-    data: *const (),
-}
-
-*/
 
 pub struct WakeHandle(usize);
 
@@ -34,16 +24,23 @@ pub struct WakeList {
     garbage: AtomicLinkedList<AtomicUsize>,
     // Next handle ID / length of wakers list
     size: AtomicUsize,
+    // Next one to wake
+    next: AtomicUsize,
 }
 
 impl WakeList {
+    /// Create a new wake list
     pub fn new() -> Self {
         let wakers = AtomicLinkedList::new();
         let garbage = AtomicLinkedList::new();
         let size = AtomicUsize::new(0);
+        let next = AtomicUsize::new(0);
 
         Self {
-            wakers, garbage, size,
+            wakers,
+            garbage,
+            size,
+            next,
         }
     }
 
@@ -54,46 +51,102 @@ impl WakeList {
         // Check garbage for reuse
         let garbage = 'garbage: {
             for garbage in self.garbage.iter() {
-                if let Some(wh) = NonZeroUsize::new(garbage.fetch_and(0, Relaxed)) {
-                    break 'garbage Some(wh);
+                if let Some(wh) =
+                    NonZeroUsize::new(garbage.fetch_and(0, Relaxed))
+                {
+                    let index = usize::from(wh) - 1;
+                    let wakey = self.wakers.iter().nth(index).unwrap();
+                    // Only if non-contended (AtomicBool could be true)
+                    if !wakey.0.load(Acquire) {
+                        break 'garbage Some((wakey, index));
+                    }
                 }
             }
             None
         };
 
-        let handle = if let Some(index) = garbage {
+        // Add waker to the list and get its index as a handle
+        let handle = if let Some((wakey, index)) = garbage {
             // Replace existing
-            let index = usize::from(index) - 1;
-            let mut size_a = self.size.load(SeqCst);
-            loop {
-                let size_b = size_a;
-                let wakey = self.wakers.iter().skip(size_a - index).next().unwrap();
-                size_a = self.size.load(SeqCst);
-                if size_a == size_b {
-                    unsafe { *wakey.1.get() = waker.into() };
-                    break;
-                }
-            }
+            unsafe { *wakey.1.get() = waker };
             index
         } else {
             // If no garbage exists, push new pair
-            self.wakers.push((AtomicBool::new(false), waker.into()));
+            self.wakers
+                .push((AtomicBool::new(false), UnsafeCell::new(waker)));
             self.size.fetch_add(1, Relaxed)
         };
 
         WakeHandle(handle)
     }
 
-    pub fn reregister(&self, handle: WakeHandle, waker: Waker) {
+    /// Re-register a `WakeHandle` with a new `Waker`.
+    pub fn reregister(&self, handle: &mut WakeHandle, waker: Waker) {
+        let wakey = self.wakers.iter().nth(handle.0).unwrap();
 
+        if !wakey.0.fetch_or(true, Acquire) {
+            // Non-contended, update
+            unsafe { *wakey.1.get() = Some(waker) };
+            wakey.0.fetch_and(false, Release);
+        } else {
+            // Contended, unregister and register again
+            self.unregister(handle);
+            *handle = self.register(waker);
+        }
     }
 
-    pub fn unregister(&self, handle: WakeHandle) {
+    /// Clean up wake handle
+    pub fn unregister(&self, handle: &mut WakeHandle) {
+        // Add to garbage
+        let handle = handle.0 + 1;
 
+        // Go through existing slots, looking for an empty one
+        for garbage in self.garbage.iter() {
+            if garbage
+                .compare_exchange(0, handle, Relaxed, Relaxed)
+                .is_ok()
+            {
+                // Added to garbage successfully
+                return;
+            }
+        }
+
+        // Garbage is out of space, allocate new node
+        self.garbage.push(AtomicUsize::new(handle));
     }
 
+    /// Attempt to wake one task
     pub fn wake_one(&self) {
+        // Starting index, goes until end then wraps around
+        let which = self.next.load(Relaxed);
+        let len = self.size.load(Relaxed);
 
+        'untilone: {
+            for wakey in self.wakers.iter().skip(which) {
+                if !wakey.0.fetch_or(true, Acquire) {
+                    if let Some(waker) = unsafe { (*wakey.1.get()).take() } {
+                        waker.wake();
+                        wakey.0.fetch_and(false, Release);
+                        break 'untilone;
+                    }
+                    wakey.0.fetch_and(false, Release);
+                }
+            }
+            for wakey in self.wakers.iter().take(which) {
+                if !wakey.0.fetch_or(true, Acquire) {
+                    if let Some(waker) = unsafe { (*wakey.1.get()).take() } {
+                        waker.wake();
+                        wakey.0.fetch_and(false, Release);
+                        break 'untilone;
+                    }
+                    wakey.0.fetch_and(false, Release);
+                }
+            }
+        }
+
+        let _ = self
+            .next
+            .fetch_update(Relaxed, Relaxed, |old| Some((old + 1) % len));
     }
 }
 
@@ -106,6 +159,20 @@ struct AtomicLinkedList<T> {
     root: AtomicPtr<Node<T>>,
 }
 
+impl<T> Drop for AtomicLinkedList<T> {
+    fn drop(&mut self) {
+        let mut node = unsafe { Box::from_raw(self.root.load(Relaxed)) };
+
+        loop {
+            let tmp = node.next.load(Relaxed);
+            if tmp.is_null() {
+                break;
+            }
+            node = unsafe { Box::from_raw(tmp) };
+        }
+    }
+}
+
 impl<T> AtomicLinkedList<T> {
     fn new() -> Self {
         let root = AtomicPtr::new(ptr::null_mut());
@@ -113,18 +180,51 @@ impl<T> AtomicLinkedList<T> {
         Self { root }
     }
 
-    fn push(&self, data: T) {
-        let mut ptr = self.root.load(Relaxed);
-        // Create node
-        let next = AtomicPtr::new(ptr);
+    fn push(&self, data: T) -> usize {
+        let nul = ptr::null_mut();
+        let next = AtomicPtr::new(nul);
         let node = Box::into_raw(Box::new(Node { next, data }));
-        // Push node
-        while let Err(other) =
-            self.root.compare_exchange(ptr, node, SeqCst, Relaxed)
-        {
-            ptr = other;
-            unsafe { (*node).next.store(ptr, Relaxed) };
+        let mut count = 0;
+        let mut ptr = self.root.load(Relaxed);
+
+        // If empty, try to write at root node
+        if ptr.is_null() {
+            if let Err(p) =
+                self.root.compare_exchange(nul, node, SeqCst, Relaxed)
+            {
+                // Handle contention, push next slot
+                ptr = p;
+                count += 1;
+                while let Err(p) = unsafe {
+                    (*ptr).next.compare_exchange(nul, node, SeqCst, Relaxed)
+                } {
+                    // Handle contention, push next slot
+                    ptr = p;
+                    count += 1;
+                }
+            }
+            return count;
         }
+
+        // Go to end of list (functionally unnecessary, but faster in theory)
+        loop {
+            let tmp = unsafe { (*ptr).next.load(Relaxed) };
+            if tmp.is_null() {
+                break;
+            }
+            ptr = tmp;
+            count += 1;
+        }
+
+        // Push at end of list
+        while let Err(p) =
+            unsafe { (*ptr).next.compare_exchange(nul, node, SeqCst, Relaxed) }
+        {
+            // Handle contention, push next slot
+            ptr = p;
+            count += 1;
+        }
+        count
     }
 
     fn iter(&self) -> AtomicLinkedListIter<'_, T> {
@@ -169,6 +269,12 @@ mod tests {
         list.push(42);
         assert_eq!(
             alloc::vec![42],
+            list.iter().cloned().collect::<alloc::vec::Vec<u32>>()
+        );
+
+        list.push(105);
+        assert_eq!(
+            alloc::vec![42, 105],
             list.iter().cloned().collect::<alloc::vec::Vec<u32>>()
         );
     }
